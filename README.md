@@ -1,4 +1,4 @@
-40% faster replacement for torch Adam Optimizer on cpu and GPU
+40% faster replacement for torch Adam Optimizer on Python/PyTorch
 
 Buy HKD Adam Pro:
 
