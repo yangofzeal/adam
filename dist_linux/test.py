@@ -1,12 +1,3 @@
-from pathlib import Path
-import sys
-
-HERE = Path(__file__).resolve().parent
-
-sys.path.insert(0, str(HERE / "dist"))
-
-from hkd_optim.sparse_adam import HKDSparseAdam
-
 import math, time, statistics, numpy as np, torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -111,6 +102,50 @@ def forward_loss(embedding, batch):
     logits = torch.zeros(BATCH, device=DEVICE, dtype=DTYPE)
     logits.scatter_add_(0, bids, weights * vals)
     return F.binary_cross_entropy_with_logits(logits, target)
+
+class HKDSparseAdam:
+    """
+    SparseAdam-compatible optimizer with compact persistent state only for
+    rows that may occur in this run.
+    """
+    def __init__(self, embedding, union):
+        self.embedding = embedding
+        self.union = union
+        self.U = len(union)
+        self.m = torch.zeros(self.U, device=DEVICE, dtype=DTYPE)
+        self.v = torch.zeros(self.U, device=DEVICE, dtype=DTYPE)
+        self.step_num = 0
+
+    @torch.no_grad()
+    def step(self):
+        grad = self.embedding.weight.grad
+        if grad is None:
+            return
+
+        grad = grad.coalesce()
+        rows = grad.indices()[0]
+        g = grad.values().squeeze(1)
+
+        # UNION is sorted. searchsorted maps global rows -> compact state rows.
+        pos = torch.searchsorted(self.union, rows)
+
+        self.step_num += 1
+        t = self.step_num
+
+        m_old = self.m[pos]
+        v_old = self.v[pos]
+
+        m_new = m_old * B1 + g * (1.0-B1)
+        v_new = v_old * B2 + g.square() * (1.0-B2)
+
+        self.m[pos] = m_new
+        self.v[pos] = v_new
+
+        # Match PyTorch SparseAdam bias correction.
+        step_size = LR * math.sqrt(1.0-B2**t) / (1.0-B1**t)
+        denom = v_new.sqrt().add_(EPS)
+
+        self.embedding.weight[rows, 0] -= step_size * (m_new / denom)
 
 def make_embedding():
     emb = nn.Embedding(N, 1, sparse=True, device=DEVICE, dtype=DTYPE)
