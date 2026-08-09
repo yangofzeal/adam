@@ -1,4 +1,4 @@
-40% faster replacement for torch Adam Optimizer on Python/PyTorch
+40% faster replacement for torch Adam Optimizer on Python/PyTorch CUDA/MPS/CPU
 
 # SYNOPSIS
 ```
