@@ -1,5 +1,14 @@
 40% faster replacement for torch Adam Optimizer on Python/PyTorch
 
+# SYNOPSIS
+from hkd_optim import HKDSparseAdam, get_hkd_device, synchronize
+...
+opt = HKDSparseAdam(emb, union, dataset_profile=DATASET_PROFILE, lr=LR, betas=(B1,B2), eps=EPS)
+...
+opt.step()
+
+Use HKDSparseAdam like torch.optim.SparseAdam.
+
 Buy HKD Adam Pro:
 
 **https://buy.stripe.com/14AeV66yDcMvfU66ALgUM01**
