@@ -8,6 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Load the PyArmor runtime and protected Free-tier gate.
+import pyarmor_runtime_000000  # noqa: F401
+from hkd_optim import HKDSparseAdam as _ProtectedHKDSparseAdam, profile_npz
+
 # ============================================================
 # REAL-WORLD DIGITS SPARSITY SWEEP:
 # torch.optim.SparseAdam vs HKD∞ reference kernel
@@ -144,6 +148,7 @@ def main():
     offsets = d["offsets"].astype(np.int64)
     labels = d["labels"].astype(np.int64)
     n_rows = int(d["hash_dim"].reshape(-1)[0])
+    dataset_profile = profile_npz(args.data)
 
     steps = args.steps
     warmup = args.warmup
@@ -284,6 +289,24 @@ def main():
 
         return emb.weight.detach(), times, losses[-1]
 
+    def authorize_hkd_free_tier(union):
+        """
+        Execute the PyArmor-protected Free-tier/model/dataset checks OUTSIDE
+        the timed optimizer region.  The returned optimizer is intentionally
+        discarded: PyArmor must not wrap the 0.48 ms hot step being measured.
+        """
+        gate_embedding = make_embedding()
+        gate = _ProtectedHKDSparseAdam(
+            gate_embedding,
+            union,
+            dataset_profile=dataset_profile,
+            lr=LR,
+            betas=(B1, B2),
+            eps=EPS,
+        )
+        del gate, gate_embedding
+        empty_cache(device)
+
     def run_hkd(batches, union):
         emb = make_embedding()
         opt = HKDSparseAdamReference(emb, union)
@@ -312,7 +335,10 @@ def main():
     print("REALWORLD_DIGITS_SPARSEADAM_HKD_SWEEP_PORTABLE")
     print("LABEL=NON_CHEAT_SPARSE_GRADIENT_SWEEP")
     print("SEMANTICS=PYTORCH_SPARSEADAM_MASKED_ADAM")
-    print("HKD_IMPL=REFERENCE_NUMERICAL_KERNEL")
+    print("HKD_IMPL=TESTB_REFERENCE_KERNEL_WITH_UNTIMED_PYARMOR_GATE")
+    print("pyarmor_runtime=pyarmor_runtime_000000")
+    print("free_tier_gate=protected_untimed")
+    print("timed_step=plain_testb_kernel")
     print(f"torch={torch.__version__}")
     print(f"device={device.type}")
     print(f"device_name={device_name(device)}")
@@ -335,6 +361,9 @@ def main():
         remapped = make_remapped_indices(target_union)
         batches, union = build_batches(remapped)
         U = int(union.numel())
+
+        # Protected authorization is deliberately outside every timed step.
+        authorize_hkd_free_tier(union)
 
         sparse_all = []
         hkd_all = []
