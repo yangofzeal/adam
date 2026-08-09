@@ -249,7 +249,19 @@ Performance depends on hardware, software versions, sparsity, model dimensions, 
 | Production-scale model sizes | — | Yes |
 
 ---
+<p align="center">
+  <img src="assets/hkd-infinity-subset-sum.png"
+       alt="HKD infinity subset-sum frontier propagation visualization"
+       width="100%">
+</p>
 
+> **HKD∞ research direction.**
+> The visualization above illustrates the broader HKD∞ idea of replacing
+> repeated combinatorial search with active-frontier propagation,
+> idempotent collapse, and permanent cross-off.
+>
+> It is a conceptual/research illustration and is separate from the
+> measured HKD SparseAdam benchmark below.
 # HKD Research
 
 HKD (Hilbert–Krylov Decomposition) is a broader research program investigating structured contraction, active-state reduction, and effective-complexity reduction in computational problems.
