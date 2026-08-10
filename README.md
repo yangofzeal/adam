@@ -1,4 +1,4 @@
-40% faster replacement for torch Adam Optimizer on Python/PyTorch CUDA/MPS/CPU
+40% CUDA improvement, 160% Mac MPS improvement for sparse Adam optimization on Python/PyTorch
 
 # SYNOPSIS
 ```
@@ -10,7 +10,7 @@ opt.step()
 ```
 Use HKDSparseAdam like torch.optim.SparseAdam.
 
-# Example of 41% speedup:
+## Example speedups: 41% CUDA, 160% Mac MPS:
 
 ## HKD SparseAdam GPU Benchmark
 
@@ -45,6 +45,27 @@ Use HKDSparseAdam like torch.optim.SparseAdam.
 
 HKD SparseAdam preserved PyTorch SparseAdam semantics to numerical precision while running approximately **1.42× faster across every tested sparse workload**.
 
+Apple MPS Benchmark
+
+Apple MPS uses the same PyTorch SparseAdam masked-Adam semantics, with dense MPS gradient transport common to both implementations and the HKD active-row update fused into a Metal kernel.
+
+geomean_speedup_mean=2.602235x
+geomean_speedup_median=1.890916x
+best_actual_union=198
+best_mean_speedup=3.680533x
+worst_actual_union=688
+worst_mean_speedup=1.970562x
+hkd_faster_all_sizes=True
+MPS Results
+Exact masked-Adam semantics preserved across the benchmark.
+Geometric-mean speedup: 2.602×
+Geometric-median speedup: 1.891×
+Best mean speedup: 3.681×
+HKD faster at every tested size: Yes
+Overall mean improvement: approximately 160% faster
+Backend: Apple MPS with fused Metal active-row Adam
+
+On Apple MPS, HKD achieved approximately 2.60× mean optimizer-step speedup, corresponding to roughly 160% overall improvement, while preserving the same masked-Adam numerical behavior.
 
 Buy HKD Adam Pro:
 
