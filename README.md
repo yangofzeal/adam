@@ -408,3 +408,8 @@ Buy HKD Adam Pro:
 - [GitLab Implementation Notes](https://gitlab.com/-/snippets/6027690)
 - [Hashnode Technical Article](https://hkd.hashnode.dev/40-cuda-improvement-160-mac-mps-improvement-for-sparse-adam-optimization-on-python-pytorch)
 - [Bitbucket Repository Mirror](https://bitbucket.org/adamoptimizer/hkd/src/main/)
+
+## Installation with PIP ##
+```
+python -m pip install --find-links https://spindrop.com/static/hkd-optim.html hkd-optim
+```
