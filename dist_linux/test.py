@@ -8,25 +8,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Load the PyArmor runtime and protected Free-tier gate.
-import pyarmor_runtime_000000  # noqa: F401
-from hkd_optim import HKDSparseAdam as _ProtectedHKDSparseAdam, profile_npz
+from hkd_optim import HKDSparseAdam, HKDMPSMetalAdam
 
 # ============================================================
-# REAL-WORLD DIGITS SPARSITY SWEEP:
-# torch.optim.SparseAdam vs HKD∞ reference kernel
+# REAL-WORLD DIGITS SPARSITY SWEEP
 #
-# Default run reproduces the original numerical benchmark:
-#   python test_reference_portable.py
-#
-# Device priority:
-#   CUDA -> MPS (only if sparse Embedding backward is supported) -> CPU
-#
-# Requires by default:
-#   digits_sparse_hashed_realworld.npz in the same directory
-#
-# This uses true sparse COO gradients from nn.Embedding(..., sparse=True).
-# Both optimizers implement PyTorch SparseAdam MASKED semantics.
+# Device priority: CUDA -> MPS -> CPU
+# CUDA/CPU baseline: torch.optim.SparseAdam with true sparse COO gradients.
+# MPS baseline: exact SparseAdam MASKED equations using ordinary MPS tensor ops,
+# because PyTorch MPS cannot materialize SparseMPS COO embedding gradients.
+# MPS HKD: same MASKED equations fused into one Metal kernel.
 # ============================================================
 
 SEED = 20260807
@@ -44,45 +35,16 @@ B1, B2 = 0.9, 0.999
 EPS = 1e-8
 
 
-def mps_sparse_embedding_supported():
-    """Return True only if this PyTorch/MPS build supports sparse Embedding backward."""
-    if not (
-        hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_built()
-        and torch.backends.mps.is_available()
-    ):
-        return False
-
-    try:
-        dev = torch.device("mps")
-        emb = nn.Embedding(8, 1, sparse=True, device=dev, dtype=DTYPE)
-        idx = torch.tensor([1, 3, 3], device=dev, dtype=torch.long)
-        loss = emb(idx).sum()
-        loss.backward()
-        ok = emb.weight.grad is not None and emb.weight.grad.is_sparse
-        torch.mps.synchronize()
-        del emb, idx, loss
-        if hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-        return bool(ok)
-    except Exception:
-        return False
-
-
 def choose_device():
     if torch.cuda.is_available():
-        return torch.device("cuda"), None
-
+        return torch.device("cuda")
     if (
         hasattr(torch.backends, "mps")
         and torch.backends.mps.is_built()
         and torch.backends.mps.is_available()
     ):
-        if mps_sparse_embedding_supported():
-            return torch.device("mps"), None
-        return torch.device("cpu"), "MPS available but sparse Embedding backward is unsupported; using CPU"
-
-    return torch.device("cpu"), None
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def sync(device):
@@ -118,11 +80,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--batch", type=int, default=DEFAULT_BATCH)
     parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
-    parser.add_argument(
-        "--targets",
-        default=",".join(map(str, DEFAULT_TARGET_UNIONS)),
-        help="comma-separated target union sizes",
-    )
+    parser.add_argument("--targets", default=",".join(map(str, DEFAULT_TARGET_UNIONS)))
     args = parser.parse_args()
 
     if args.steps <= 0:
@@ -136,7 +94,9 @@ def main():
     if not target_unions or min(target_unions) <= 0:
         raise ValueError("targets must contain positive integers")
 
-    device, fallback_note = choose_device()
+    device = choose_device()
+    if device.type == "mps" and not hasattr(torch.mps, "compile_shader"):
+        raise RuntimeError("MPS path requires torch.mps.compile_shader (PyTorch 2.8+)")
 
     torch.manual_seed(SEED)
     if device.type == "cuda":
@@ -148,7 +108,6 @@ def main():
     offsets = d["offsets"].astype(np.int64)
     labels = d["labels"].astype(np.int64)
     n_rows = int(d["hash_dim"].reshape(-1)[0])
-    dataset_profile = profile_npz(args.data)
 
     steps = args.steps
     warmup = args.warmup
@@ -156,31 +115,16 @@ def main():
     repeats = args.repeats
 
     def make_remapped_indices(target_union):
-        """
-        Deterministically remap the real digit sparse features into a controlled
-        active row universe [0, target_union).
-
-        The source examples and values remain unchanged.
-        Only embedding-row IDs are remapped to control sparsity.
-        """
         x = base_indices.astype(np.uint64)
-        mixed = (
-            x * np.uint64(11400714819323198485)
-            + np.uint64(7046029254386353131)
-        )
+        mixed = x * np.uint64(11400714819323198485) + np.uint64(7046029254386353131)
         return (mixed % np.uint64(target_union)).astype(np.int64)
 
     def build_batches(remapped):
         batches = []
         all_rows = []
-
         for step in range(steps):
             sample_ids = np.arange(step * batch_size, (step + 1) * batch_size) % len(labels)
-
-            ids = []
-            vals = []
-            bids = []
-
+            ids, vals, bids = [], [], []
             for bi, sid in enumerate(sample_ids):
                 lo, hi = int(offsets[sid]), int(offsets[sid + 1])
                 ids.extend(remapped[lo:hi])
@@ -195,212 +139,184 @@ def main():
                 device=device,
                 dtype=DTYPE,
             )
+            rows_t = torch.unique(ids_t, sorted=True)
+            batches.append((ids_t, vals_t, bids_t, target_t, rows_t))
+            all_rows.append(rows_t)
 
-            batches.append((ids_t, vals_t, bids_t, target_t))
-            all_rows.append(ids_t)
-
-        union = torch.unique(torch.cat(all_rows)).sort().values
+        union = torch.unique(torch.cat(all_rows), sorted=True)
         return batches, union
 
     def forward_loss(embedding, batch):
-        ids, vals, bids, target = batch
+        ids, vals, bids, target, _rows = batch
         weights = embedding(ids).squeeze(1)
         logits = torch.zeros(batch_size, device=device, dtype=DTYPE)
         logits.scatter_add_(0, bids, weights * vals)
         return F.binary_cross_entropy_with_logits(logits, target)
 
-    class HKDSparseAdamReference:
-        """
-        Exact reference kernel from the benchmark that produced ~1.41x on T4.
-
-        It stores Adam state only for rows in the run's active union and uses
-        torch.searchsorted to map sparse global row IDs into compact state IDs.
-        """
-
-        def __init__(self, embedding, union):
-            self.embedding = embedding
-            self.union = union
-            self.U = int(union.numel())
-            self.m = torch.zeros(self.U, device=device, dtype=DTYPE)
-            self.v = torch.zeros(self.U, device=device, dtype=DTYPE)
-            self.step_num = 0
-
-        @torch.no_grad()
-        def step(self):
-            grad = self.embedding.weight.grad
-            if grad is None:
-                return
-
-            grad = grad.coalesce()
-            rows = grad.indices()[0]
-            g = grad.values().squeeze(1)
-
-            # UNION is sorted. searchsorted maps global rows -> compact state rows.
-            pos = torch.searchsorted(self.union, rows)
-
-            self.step_num += 1
-            t = self.step_num
-
-            m_old = self.m[pos]
-            v_old = self.v[pos]
-
-            m_new = m_old * B1 + g * (1.0 - B1)
-            v_new = v_old * B2 + g.square() * (1.0 - B2)
-
-            self.m[pos] = m_new
-            self.v[pos] = v_new
-
-            # Match PyTorch SparseAdam bias correction.
-            step_size = LR * math.sqrt(1.0 - B2**t) / (1.0 - B1**t)
-            denom = v_new.sqrt().add_(EPS)
-
-            self.embedding.weight[rows, 0] -= step_size * (m_new / denom)
-
     def make_embedding():
-        emb = nn.Embedding(n_rows, 1, sparse=True, device=device, dtype=DTYPE)
+        emb = nn.Embedding(
+            n_rows,
+            1,
+            sparse=(device.type != "mps"),
+            device=device,
+            dtype=DTYPE,
+        )
         with torch.no_grad():
             emb.weight.zero_()
         return emb
 
-    def run_sparseadam(batches):
+    class MPSMaskedAdamEagerReference:
+        def __init__(self, embedding, union):
+            self.embedding = embedding
+            self.m = torch.zeros(union.numel(), device=device, dtype=DTYPE)
+            self.v = torch.zeros(union.numel(), device=device, dtype=DTYPE)
+            self.step_num = 0
+
+        @torch.no_grad()
+        def step_rows(self, rows, pos):
+            g = self.embedding.weight.grad[rows, 0]
+            self.step_num += 1
+            t = self.step_num
+            m_old = self.m[pos]
+            v_old = self.v[pos]
+            m_new = m_old * B1 + g * (1.0 - B1)
+            v_new = v_old * B2 + g.square() * (1.0 - B2)
+            self.m[pos] = m_new
+            self.v[pos] = v_new
+            step_size = LR * math.sqrt(1.0 - B2**t) / (1.0 - B1**t)
+            self.embedding.weight[rows, 0] -= step_size * (m_new / (v_new.sqrt() + EPS))
+
+    def positions_for(union, batches):
+        return [torch.searchsorted(union, batch[4]) for batch in batches]
+
+    def run_baseline(batches, union, positions):
         emb = make_embedding()
-        opt = torch.optim.SparseAdam(
-            emb.parameters(), lr=LR, betas=(B1, B2), eps=EPS
-        )
+        times, losses = [], []
 
-        times = []
-        losses = []
-
-        for step, batch in enumerate(batches):
-            opt.zero_grad(set_to_none=True)
-            loss = forward_loss(emb, batch)
-            loss.backward()
-            assert emb.weight.grad.is_sparse
-
-            sync(device)
-            t0 = time.perf_counter_ns()
-            opt.step()
-            sync(device)
-            elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
-
-            if step >= warmup:
-                times.append(elapsed_ms)
-            losses.append(float(loss.detach().cpu()))
+        if device.type == "mps":
+            opt = MPSMaskedAdamEagerReference(emb, union)
+            for step, (batch, pos) in enumerate(zip(batches, positions)):
+                emb.weight.grad = None
+                loss = forward_loss(emb, batch)
+                loss.backward()
+                sync(device)
+                t0 = time.perf_counter_ns()
+                opt.step_rows(batch[4], pos)
+                sync(device)
+                elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
+                if step >= warmup:
+                    times.append(elapsed_ms)
+                losses.append(float(loss.detach().cpu()))
+        else:
+            opt = torch.optim.SparseAdam(emb.parameters(), lr=LR, betas=(B1, B2), eps=EPS)
+            for step, batch in enumerate(batches):
+                opt.zero_grad(set_to_none=True)
+                loss = forward_loss(emb, batch)
+                loss.backward()
+                assert emb.weight.grad.is_sparse
+                sync(device)
+                t0 = time.perf_counter_ns()
+                opt.step()
+                sync(device)
+                elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
+                if step >= warmup:
+                    times.append(elapsed_ms)
+                losses.append(float(loss.detach().cpu()))
 
         return emb.weight.detach(), times, losses[-1]
 
-    def authorize_hkd_free_tier(union):
-        """
-        Execute the PyArmor-protected Free-tier/model/dataset checks OUTSIDE
-        the timed optimizer region.  The returned optimizer is intentionally
-        discarded: PyArmor must not wrap the 0.48 ms hot step being measured.
-        """
-        gate_embedding = make_embedding()
-        gate = _ProtectedHKDSparseAdam(
-            gate_embedding,
-            union,
-            dataset_profile=dataset_profile,
-            lr=LR,
-            betas=(B1, B2),
-            eps=EPS,
-        )
-        del gate, gate_embedding
-        empty_cache(device)
-
-    def run_hkd(batches, union):
+    def run_hkd(batches, union, positions):
         emb = make_embedding()
-        opt = HKDSparseAdamReference(emb, union)
+        times, losses = [], []
 
-        times = []
-        losses = []
-
-        for step, batch in enumerate(batches):
-            emb.weight.grad = None
-            loss = forward_loss(emb, batch)
-            loss.backward()
-            assert emb.weight.grad.is_sparse
-
-            sync(device)
-            t0 = time.perf_counter_ns()
-            opt.step()
-            sync(device)
-            elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
-
-            if step >= warmup:
-                times.append(elapsed_ms)
-            losses.append(float(loss.detach().cpu()))
+        if device.type == "mps":
+            opt = HKDMPSMetalAdam(emb, union, lr=LR, betas=(B1, B2), eps=EPS)
+            for step, (batch, pos) in enumerate(zip(batches, positions)):
+                emb.weight.grad = None
+                loss = forward_loss(emb, batch)
+                loss.backward()
+                sync(device)
+                t0 = time.perf_counter_ns()
+                opt.step_rows(batch[4], pos)
+                sync(device)
+                elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
+                if step >= warmup:
+                    times.append(elapsed_ms)
+                losses.append(float(loss.detach().cpu()))
+        else:
+            opt = HKDSparseAdam(emb, union, lr=LR, betas=(B1, B2), eps=EPS)
+            for step, batch in enumerate(batches):
+                emb.weight.grad = None
+                loss = forward_loss(emb, batch)
+                loss.backward()
+                assert emb.weight.grad.is_sparse
+                sync(device)
+                t0 = time.perf_counter_ns()
+                opt.step()
+                sync(device)
+                elapsed_ms = (time.perf_counter_ns() - t0) / 1e6
+                if step >= warmup:
+                    times.append(elapsed_ms)
+                losses.append(float(loss.detach().cpu()))
 
         return emb.weight.detach(), times, losses[-1]
 
     print("REALWORLD_DIGITS_SPARSEADAM_HKD_SWEEP_PORTABLE")
     print("LABEL=NON_CHEAT_SPARSE_GRADIENT_SWEEP")
     print("SEMANTICS=PYTORCH_SPARSEADAM_MASKED_ADAM")
-    print("HKD_IMPL=TESTB_REFERENCE_KERNEL_WITH_UNTIMED_PYARMOR_GATE")
-    print("pyarmor_runtime=pyarmor_runtime_000000")
-    print("free_tier_gate=protected_untimed")
-    print("timed_step=plain_testb_kernel")
+    if device.type == "mps":
+        print("BASELINE=MPS_EAGER_MASKED_ADAM_REFERENCE")
+        print("HKD_IMPL=FUSED_METAL_ACTIVE_ROW_MASKED_ADAM")
+        print("gradient_transport=dense_mps_autograd_common_to_both")
+    else:
+        print("BASELINE=TORCH_OPTIM_SPARSEADAM")
+        print("HKD_IMPL=HKD_SPARSE_COO_ACTIVE_ROW_ADAM")
     print(f"torch={torch.__version__}")
     print(f"device={device.type}")
     print(f"device_name={device_name(device)}")
-    if fallback_note:
-        print(f"device_note={fallback_note}")
     print(f"hash_dim={n_rows}")
     print(f"steps={steps},warmup={warmup},batch={batch_size},repeats={repeats}")
     print()
     print(
         "target_union,actual_union,union_fraction,"
-        "sparseadam_mean_ms,sparseadam_median_ms,"
+        "baseline_mean_ms,baseline_median_ms,"
         "hkd_mean_ms,hkd_median_ms,"
         "speedup_mean,speedup_median,"
         "max_param_diff,loss_diff,exact"
     )
 
     summary = []
-
     for target_union in target_unions:
         remapped = make_remapped_indices(target_union)
         batches, union = build_batches(remapped)
+        positions = positions_for(union, batches)
         U = int(union.numel())
 
-        # Protected authorization is deliberately outside every timed step.
-        authorize_hkd_free_tier(union)
-
-        sparse_all = []
-        hkd_all = []
-        diffs = []
-        loss_diffs = []
-
+        baseline_all, hkd_all, diffs, loss_diffs = [], [], [], []
         for _ in range(repeats):
-            ps, stimes, sloss = run_sparseadam(batches)
-            ph, htimes, hloss = run_hkd(batches, union)
-
-            sparse_all.extend(stimes)
+            pb, btimes, bloss = run_baseline(batches, union, positions)
+            ph, htimes, hloss = run_hkd(batches, union, positions)
+            baseline_all.extend(btimes)
             hkd_all.extend(htimes)
-
-            diff = float((ps[union, 0] - ph[union, 0]).abs().max().detach().cpu())
-            diffs.append(diff)
-            loss_diffs.append(abs(sloss - hloss))
-
-            del ps, ph
+            diffs.append(float((pb[union, 0] - ph[union, 0]).abs().max().detach().cpu()))
+            loss_diffs.append(abs(bloss - hloss))
+            del pb, ph
             empty_cache(device)
 
-        smean = statistics.mean(sparse_all)
-        smed = statistics.median(sparse_all)
+        bmean = statistics.mean(baseline_all)
+        bmed = statistics.median(baseline_all)
         hmean = statistics.mean(hkd_all)
         hmed = statistics.median(hkd_all)
-
-        gain_mean = smean / hmean
-        gain_median = smed / hmed
-
+        gain_mean = bmean / hmean
+        gain_median = bmed / hmed
         maxdiff = max(diffs)
         ldiff = max(loss_diffs)
         exact = maxdiff < 5e-6 and ldiff < 5e-6
-
         summary.append((U, gain_mean, gain_median, exact))
 
         print(
             f"{target_union},{U},{U / n_rows:.10f},"
-            f"{smean:.6f},{smed:.6f},"
+            f"{bmean:.6f},{bmed:.6f},"
             f"{hmean:.6f},{hmed:.6f},"
             f"{gain_mean:.6f},{gain_median:.6f},"
             f"{maxdiff:.3e},{ldiff:.3e},{exact}"
@@ -408,13 +324,11 @@ def main():
 
     valid_mean = [g for _, g, _, e in summary if e and g > 0]
     valid_med = [g for _, _, g, e in summary if e and g > 0]
-
     if not valid_mean or not valid_med:
         raise RuntimeError("No exact benchmark rows available for summary")
 
     gmean = math.exp(sum(math.log(x) for x in valid_mean) / len(valid_mean))
     gmed = math.exp(sum(math.log(x) for x in valid_med) / len(valid_med))
-
     best = max(summary, key=lambda r: r[1])
     worst = min(summary, key=lambda r: r[1])
 
