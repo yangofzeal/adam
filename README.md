@@ -406,5 +406,5 @@ Buy HKD Adam Pro:
 ## External Documentation & Mirrors
 - [Zenodo DOI Record](https://zenodo.org/records/21862809)
 - [GitLab Implementation Notes](https://gitlab.com/-/snippets/6027690)
-- [Hashnode Technical Article](https://hkd.hashnode.dev/how-to-achieve-a-40-adam-optimizer-improvement-in-pytorch)
+- [Hashnode Technical Article](https://hkd.hashnode.dev/40-cuda-improvement-160-mac-mps-improvement-for-sparse-adam-optimization-on-python-pytorch)
 - [Bitbucket Repository Mirror](https://bitbucket.org/adamoptimizer/hkd/src/main/)
