@@ -65,7 +65,7 @@ HKD faster at every tested size: Yes
 Overall mean improvement: approximately 160% faster
 Backend: Apple MPS with fused Metal active-row Adam
 
-On Apple MPS, HKD achieved approximately 2.60× mean optimizer-step speedup, corresponding to roughly 160% overall improvement, while preserving the same masked-Adam numerical behavior.
+On Apple MPS, HKD achieved approximately 2.60× mean optimizer-step speedup, corresponding to roughly **160% overall improvement**, while preserving the same masked-Adam numerical behavior.
 
 Buy HKD Adam Pro:
 
