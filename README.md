@@ -381,3 +381,9 @@ python3 test.py
 Buy HKD Adam Pro:
 
 **https://buy.stripe.com/14AeV66yDcMvfU66ALgUM01**
+
+## External Documentation & Mirrors
+- [Zenodo DOI Record](https://zenodo.org/records/21862809)
+- [GitLab Implementation Notes](https://gitlab.com/-/snippets/6027690)
+- [Hashnode Technical Article](https://hkd.hashnode.dev/how-to-achieve-a-40-adam-optimizer-improvement-in-pytorch)
+- [Bitbucket Repository Mirror](https://bitbucket.org/adamoptimizer/hkd/src/main/)
