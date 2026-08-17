@@ -88,10 +88,6 @@ The free trial includes everything needed to run the supplied HKD SparseAdam dem
 ### Run
 
 ```bash
-cd dist_linux/ ## linux
-## or
-cd dist_macos/ ## mac
-
 python3 test.py
 ```
 
